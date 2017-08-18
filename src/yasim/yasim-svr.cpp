@@ -50,7 +50,7 @@ struct status {
     float resv[4];
 };
 
-bool readState(FGFDM *fdm, Airplane *a) {
+bool readState(FGFDM *fdm, Airplane *a, bool *pinned) {
     struct command frm;
 
     ssize_t rd = read(STDIN_FILENO, &frm, sizeof(frm));
@@ -67,7 +67,7 @@ bool readState(FGFDM *fdm, Airplane *a) {
         /* Before arming, hold position and run model... */
         Model *m = a->getModel();
         State *s = m->getState();
-        
+
         float xyz2ned[9];
         Glue::xyz2nedMat(0, 0, xyz2ned);
 
@@ -95,18 +95,27 @@ bool readState(FGFDM *fdm, Airplane *a) {
 
         a->initEngines();
 
-        fdm->getExternalInput();
+        *pinned = true;
+
+        fgSetFloat("/controls/flight/aileron", 0);
+        fgSetFloat("/controls/flight/elevator", 0);
+        fgSetFloat("/controls/flight/rudder", 0);
+        fgSetFloat("/controls/engines/engine[0]/throttle", 0.5);
+    } else {
+        *pinned = false;
+
+        fgSetFloat("/controls/flight/aileron", frm.roll);
+        fgSetFloat("/controls/flight/elevator", -frm.pitch);
+        fgSetFloat("/controls/flight/rudder", frm.yaw);
+        fgSetFloat("/controls/engines/engine[0]/throttle", frm.throttle);
     }
 
-    fgSetFloat("/controls/flight/aileron", frm.roll);
-    fgSetFloat("/controls/flight/elevator", -frm.pitch);
-    fgSetFloat("/controls/flight/rudder", frm.yaw);
-    fgSetFloat("/controls/engines/engine[0]/throttle", frm.throttle);
+    fdm->getExternalInput();
 
     return true;
 }
 
-bool writeState(Airplane *a)
+bool writeState(Airplane *a, bool pinned)
 {
     Model *m = a->getModel();
     State *s = m->getState();
@@ -116,9 +125,6 @@ bool writeState(Airplane *a)
     memset(&frm, 0, sizeof(frm));
 
     frm.magic=0x00700799;
-
-    // ------ Pilot-frame accelerations
-    a->getPilotAccel(frm.acc);
 
     // ------ Position
     sgCartToGeod(s->pos, &frm.lat, &frm.lon, &frm.alt);
@@ -141,13 +147,34 @@ bool writeState(Airplane *a)
 
     Math::vmul33(s->orient, s->rot, rot);
 
-    // Fix for odd coordinate system...
-    frm.p = rot[0];
-    frm.q = -rot[1];
-    frm.r = -rot[2];
+    if (pinned) {
+        /* If we're not armed, ensure that we return nil rotational rates
+         * and accelerations and vels to minimize the confusion of the INS.
+         */
+        frm.p = 0;
+        frm.q = 0;
+        frm.r = 0;
 
-    // ------ NED velocities
-    Math::vmul33(xyz2ned, s->v, frm.vel);
+        frm.acc[0] = 0;
+        frm.acc[1] = 0;
+        frm.acc[2] = -9.8;
+
+        frm.vel[0] = 0;
+        frm.vel[1] = 0;
+        frm.vel[2] = 0;
+
+    } else {
+        // Fix for odd coordinate system...
+        frm.p = rot[0];
+        frm.q = -rot[1];
+        frm.r = -rot[2];
+
+        // ------ Pilot-frame accelerations
+        a->getPilotAccel(frm.acc);
+
+        // ------ NED velocities
+        Math::vmul33(xyz2ned, s->v, frm.vel);
+    }
 
     // These next updates don't really fit in here, but they're more convenient
     // to factor this way.
@@ -229,12 +256,14 @@ int main(int argc, char** argv)
 
     long double t = 0;
 
-    while (writeState(a)) {
+    bool pinned = true;
+
+    while (writeState(a, pinned)) {
         if (m->isCrashed()) {
             break;
         }
 
-        if (!readState(fdm, a)) {
+        if (!readState(fdm, a, &pinned)) {
             break;
         }
 
